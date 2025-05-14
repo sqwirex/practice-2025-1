@@ -454,40 +454,6 @@ async def is_banned(user_id: str) -> bool:
     user_data = store["users"].get(str(user_id), {})
     return user_data.get("banned", False)
 
-@check_ban_status
-async def suggest_white_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатия на кнопку предложения слова в белый список"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Извлекаем слово из callback_data и нормализуем его
-    word = normalize(query.data.split(':', 1)[1])
-    user_id = str(update.effective_user.id)
-    
-    # Загружаем данные пользователя
-    store = load_store()
-    user = store["users"].get(user_id, {})
-    
-    # Добавляем слово в предложения для белого списка, если его там еще нет
-    if word not in suggestions["white"]:
-        suggestions["white"].add(word)
-        save_suggestions(suggestions)
-    
-    # Добавляем слово в список предложенных пользователем, если его там еще нет
-    if "suggested_words" not in user:
-        user["suggested_words"] = []
-    
-    if word not in user["suggested_words"]:
-        user["suggested_words"].append(word)
-        save_store(store)
-    
-    # Обновляем сообщение, убирая кнопку
-    await query.edit_message_text(
-        f"✅ Слово «{word}» добавлено в предложения для белого списка.\n"
-        "Спасибо за ваш вклад! Администратор рассмотрит ваше предложение."
-    )
-    
-    return GUESSING
 
 
 async def send_activity_periodic(context: ContextTypes.DEFAULT_TYPE):
@@ -815,6 +781,50 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Игра продолжается
+    return GUESSING
+
+
+@check_ban_status
+async def suggest_white_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия на кнопку предложения слова в белый список"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем слово из callback_data и нормализуем его
+    word = normalize(query.data.split(':', 1)[1])
+    user_id = str(update.effective_user.id)
+    
+    # Загружаем текущие предложения и основной словарь
+    current_suggestions = load_suggestions()
+    with BASE_FILE.open("r", encoding="utf-8") as f:
+        base_words = set(json.load(f))
+    
+    # Загружаем данные пользователя
+    store = load_store()
+    user = store["users"].get(user_id, {})
+    
+    # Добавляем слово в предложения для белого списка, если его там еще нет
+    if word not in current_suggestions["white"] and word not in base_words:
+        current_suggestions["white"].add(word)
+        save_suggestions(current_suggestions)
+        # Обновляем глобальную переменную
+        global suggestions
+        suggestions = current_suggestions
+    
+    # Добавляем слово в список предложенных пользователем, если его там еще нет
+    if "suggested_words" not in user:
+        user["suggested_words"] = []
+    
+    if word not in user["suggested_words"]:
+        user["suggested_words"].append(word)
+        save_store(store)
+    
+    # Обновляем сообщение, убирая кнопку
+    await query.edit_message_text(
+        f"✅ Слово «{word}» добавлено в предложения для белого списка.\n"
+        "Спасибо за ваш вклад! Администратор рассмотрит ваше предложение."
+    )
+    
     return GUESSING
 
 
