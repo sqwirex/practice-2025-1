@@ -4,6 +4,7 @@ import random
 import json
 
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo  # Python 3.9+
 from io import BytesIO
@@ -16,7 +17,9 @@ from telegram import (
     ReplyKeyboardRemove,
     BotCommand,
     BotCommandScopeChat,
-    InputFile
+    InputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 
 from telegram.ext import (
@@ -26,7 +29,10 @@ from telegram.ext import (
     ConversationHandler,
     filters,
     ContextTypes,
+    CallbackQueryHandler,
 )
+
+from telegram.error import BadRequest
 
 from dotenv import load_dotenv
 
@@ -65,7 +71,9 @@ async def set_commands(app):
             BotCommand("suggestions_remove", "Удалить что-то из фидбека"),
             BotCommand("suggestions_approve", "Внести изменения в словарь"),
             BotCommand("broadcast", "Отправить сообщение всем юзерам"),
-            BotCommand("broadcast_cancel", "Отменить отправку")
+            BotCommand("broadcast_cancel", "Отменить отправку"),
+            BotCommand("ban", "Заблокировать пользователя"),
+            BotCommand("unban", "Разблокировать пользователя"),
         ],
         scope=BotCommandScopeChat(chat_id=ADMIN_ID)
     )
@@ -171,6 +179,7 @@ def update_user_activity(user) -> None:
     - is_bot, is_premium, language_code
     - last_seen_msk (по московскому времени)
     - stats (если еще нет): games_played, wins, losses, win rate
+    - banned: флаг бана пользователя (если не установлен, то False)
     """
     store = load_store()
     uid = str(user.id)
@@ -180,12 +189,14 @@ def update_user_activity(user) -> None:
     if uid not in users:
         users[uid] = {
             "first_name": user.first_name,
+            "suggested_words": [],  # Список слов, предложенных пользователем
             "stats": {
                 "games_played": 0,
                 "wins": 0,
                 "losses": 0,
                 "win_rate": 0.0
-            }
+            },
+            "banned": False  # По умолчанию пользователь не забанен
         }
 
     u = users[uid]
@@ -385,7 +396,11 @@ with BASE_FILE.open("r", encoding="utf-8") as f:
     base_words = json.load(f)
 
 # Фильтруем по критериям: только буквы, длина 4–11 символов
-filtered = [w for w in base_words if w.isalpha() and 4 <= len(w) <= 11]
+# и нормализуем слова (нижний регистр, замена ё на е)
+filtered = [normalize(w) for w in base_words if w.isalpha() and 4 <= len(w) <= 11]
+
+# Удаляем дубликаты, которые могли появиться после нормализации
+filtered = list(dict.fromkeys(filtered))
 
 # Сортируем список и записываем обратно в base_words.json
 WORDLIST = sorted(filtered)
@@ -414,6 +429,66 @@ def make_feedback(secret: str, guess: str) -> str:
 
 
 # --- Обработчики команд ---
+
+def check_ban_status(handler):
+    """Декоратор для проверки бана пользователя перед выполнением обработчика"""
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = str(update.effective_user.id)
+        if await is_banned(user_id):
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("❌ Вы заблокированы в этом боте.", show_alert=True)
+                else:
+                    await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+                return
+            except Exception as e:
+                logger.warning(f"Error handling banned user {user_id}: {e}")
+                return
+        return await handler(update, context, *args, **kwargs)
+    return wrapper
+
+async def is_banned(user_id: str) -> bool:
+    """Проверяет, забанен ли пользователь"""
+    store = load_store()
+    user_data = store["users"].get(str(user_id), {})
+    return user_data.get("banned", False)
+
+@check_ban_status
+async def suggest_white_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия на кнопку предложения слова в белый список"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем слово из callback_data и нормализуем его
+    word = normalize(query.data.split(':', 1)[1])
+    user_id = str(update.effective_user.id)
+    
+    # Загружаем данные пользователя
+    store = load_store()
+    user = store["users"].get(user_id, {})
+    
+    # Добавляем слово в предложения для белого списка, если его там еще нет
+    if word not in suggestions["white"]:
+        suggestions["white"].add(word)
+        save_suggestions(suggestions)
+    
+    # Добавляем слово в список предложенных пользователем, если его там еще нет
+    if "suggested_words" not in user:
+        user["suggested_words"] = []
+    
+    if word not in user["suggested_words"]:
+        user["suggested_words"].append(word)
+        save_store(store)
+    
+    # Обновляем сообщение, убирая кнопку
+    await query.edit_message_text(
+        f"✅ Слово «{word}» добавлено в предложения для белого списка.\n"
+        "Спасибо за ваш вклад! Администратор рассмотрит ваше предложение."
+    )
+    
+    return GUESSING
+
 
 async def send_activity_periodic(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -487,6 +562,7 @@ async def send_unfinished_games(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+@check_ban_status
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_notification_flag(str(update.effective_user.id))
     # если сейчас в игре или в фидбеке — молчим
@@ -500,6 +576,7 @@ async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@check_ban_status
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_activity(update.effective_user)
     store = load_store()
@@ -540,6 +617,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@check_ban_status
 async def ask_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = ASK_LENGTH
     update_user_activity(update.effective_user)
@@ -565,6 +643,7 @@ async def ask_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_LENGTH
 
 
+@check_ban_status
 async def receive_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_activity(update.effective_user)
     text = update.message.text.strip()
@@ -603,6 +682,7 @@ async def receive_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GUESSING
 
 
+@check_ban_status
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     store   = load_store()
@@ -624,9 +704,41 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     secret = cg["secret"]
     length = len(secret)
 
+    # Нормализуем слово для проверки (приводим к нижний регистр и заменяем ё на е)
+    normalized_guess = normalize(guess)
+    
     # Валидация
-    if len(guess) != length or guess not in WORDLIST:
-        await update.message.reply_text(f"Введите существующее слово из {length} букв.")
+    if len(guess) != length:
+        await update.message.reply_text(f"Введите слово из {length} букв.")
+        return GUESSING
+    
+    # Проверяем, не предлагал ли пользователь это слово ранее
+    user_id = str(update.effective_user.id)
+    user = store["users"].get(user_id, {})
+    suggested_words = user.get("suggested_words", [])
+    
+    if normalized_guess in suggested_words and normalized_guess not in WORDLIST:
+        await update.message.reply_text(
+            "Извините, это слово уже было предложено вами, но еще не добавлено в словарь.\n"
+            "Пожалуйста, дождитесь его проверки администратором."
+        )
+        return GUESSING
+    
+    if normalized_guess not in WORDLIST:
+        # Предлагаем добавить слово в белый список
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "Предложить добавить слово",
+                    callback_data=f"suggest_white:{guess}"
+                )
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"Слово «{normalized_guess}» не найдено в словаре.",
+            reply_markup=reply_markup
+        )
         return GUESSING
 
     # Сохраняем ход
@@ -705,16 +817,20 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Игра продолжается
     return GUESSING
 
+
+@check_ban_status
 async def ignore_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Команды /start и /play не работают во время игры — сначала /reset.")
     return ASK_LENGTH
 
 
+@check_ban_status
 async def ignore_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Команды /start и /play не работают во время игры — сначала /reset.")
     return GUESSING
 
 
+@check_ban_status
 async def hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     store = load_store()
@@ -769,6 +885,7 @@ async def hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GUESSING
 
 
+@check_ban_status
 async def hint_not_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сообщение, если /hint вызвали не во время игры."""
     clear_notification_flag(str(update.effective_user.id))
@@ -777,6 +894,7 @@ async def hint_not_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return context.user_data.get("state", ASK_LENGTH)
 
 
+@check_ban_status
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_activity(update.effective_user)
 
@@ -792,12 +910,14 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@check_ban_status
 async def reset_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_activity(update.effective_user)
     clear_notification_flag(str(update.effective_user.id))
     await update.message.reply_text("Сейчас нечего сбрасывать — начните игру: /play")
 
 
+@check_ban_status
 async def notification_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     store = load_store()
@@ -811,6 +931,7 @@ async def notification_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"Уведомления при пробуждении бота {state}.")
 
 
+@check_ban_status
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает личную статистику — только вне игры."""
     update_user_activity(update.effective_user)
@@ -833,6 +954,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@check_ban_status
 async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_activity(update.effective_user)
     """Показывает глобальную статистику — только вне игры."""
@@ -864,6 +986,7 @@ async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@check_ban_status
 async def only_outside_game(update, context):
     clear_notification_flag(str(update.effective_user.id))
     await update.message.reply_text("Эту команду можно использовать только вне игры.")
@@ -871,6 +994,7 @@ async def only_outside_game(update, context):
     return context.user_data.get("state", ConversationHandler.END)
 
 
+@check_ban_status
 async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # запретим во время игры
     store = load_store()
@@ -898,6 +1022,7 @@ async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FEEDBACK_CHOOSE
 
 
+@check_ban_status
 async def feedback_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text == "Отмена":
@@ -921,6 +1046,7 @@ async def feedback_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FEEDBACK_WORD
 
 
+@check_ban_status
 async def feedback_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     word = normalize(update.message.text)
     target = context.user_data["fb_target"]
@@ -940,6 +1066,18 @@ async def feedback_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if word in WORDLIST:
             suggestions["black"].add(word)
             save_suggestions(suggestions)
+            
+            # Добавляем слово в профиль пользователя
+            store = load_store()
+            user_id = str(update.effective_user.id)
+            if user_id not in store["users"]:
+                store["users"][user_id] = {}
+            if "suggested_words" not in store["users"][user_id]:
+                store["users"][user_id]["suggested_words"] = []
+            if word not in store["users"][user_id]["suggested_words"]:
+                store["users"][user_id]["suggested_words"].append(word)
+                save_store(store)
+                
             resp = "Спасибо, добавил в предложения для чёрного списка."
         else:
             resp = "Нельзя: слово должно быть в основном словаре."
@@ -949,6 +1087,18 @@ async def feedback_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 4 <= len(word) <= 11 and word not in WORDLIST:
             suggestions["white"].add(word)
             save_suggestions(suggestions)
+            
+            # Добавляем слово в профиль пользователя
+            store = load_store()
+            user_id = str(update.effective_user.id)
+            if user_id not in store["users"]:
+                store["users"][user_id] = {}
+            if "suggested_words" not in store["users"][user_id]:
+                store["users"][user_id]["suggested_words"] = []
+            if word not in store["users"][user_id]["suggested_words"]:
+                store["users"][user_id]["suggested_words"].append(word)
+                save_store(store)
+                
             resp = "Спасибо, добавил в предложения для белого списка."
         else:
             if word in WORDLIST:
@@ -964,12 +1114,14 @@ async def feedback_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@check_ban_status
 async def feedback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
+@check_ban_status
 async def block_during_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # любой посторонний ввод заглушаем
     await update.message.reply_text(
@@ -979,6 +1131,7 @@ async def block_during_feedback(update: Update, context: ContextTypes.DEFAULT_TY
     return context.user_data.get("feedback_state", FEEDBACK_CHOOSE)
 
 
+@check_ban_status
 async def feedback_not_allowed_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Нельзя отправлять фидбек пока вы выбираете длину слова. "
@@ -987,6 +1140,7 @@ async def feedback_not_allowed_ask(update: Update, context: ContextTypes.DEFAULT
     return ASK_LENGTH
 
 
+@check_ban_status
 async def feedback_not_allowed_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Нельзя отправлять фидбек во время игры. "
@@ -1118,15 +1272,37 @@ async def suggestions_remove_process(update: Update, context: ContextTypes.DEFAU
                 removed[key].append(w)
 
     save_suggestions(sugg)
-
+    
+    # Удаляем слова из профилей пользователей
+    store = load_store()
+    removed_count = 0
+    
+    # Собираем все удаленные слова из обоих списков
+    all_removed_words = set(removed["black"]) | set(removed["white"])
+    
+    # Проходим по всем пользователям и удаляем слова из их списков
+    for user_id, user_data in store["users"].items():
+        if "suggested_words" in user_data:
+            before = len(user_data["suggested_words"])
+            user_data["suggested_words"] = [w for w in user_data["suggested_words"] 
+                                         if w not in all_removed_words]
+            removed_count += before - len(user_data["suggested_words"])
+    
+    # Сохраняем изменения, если что-то было удалено
+    if removed_count > 0:
+        save_store(store)
+    
     # формируем ответ
     parts = []
     if removed["black"]:
         parts.append(f'Из черного удалено: {", ".join(removed["black"])}')
     if removed["white"]:
         parts.append(f'Из белого удалено: {", ".join(removed["white"])}')
+    if removed_count > 0:
+        parts.append(f'Из профилей пользователей удалено {removed_count} слов.')
     if not parts:
         parts = ["Ничего не удалено."]
+        
     await update.message.reply_text("\n".join(parts))
     context.user_data.pop("in_remove", None)
     context.user_data["just_done"] = True
@@ -1166,12 +1342,32 @@ async def suggestions_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     global WORDLIST
     WORDLIST = filtered
 
-    # 7. Очищаем suggestions.json
+    # 7. Удаляем одобренные слова из списка предложенных у пользователей
+    store = load_store()
+    removed_count = 0
+    
+    # Собираем все одобренные слова (белый список)
+    approved_words = sugg["white"]
+    
+    # Проходим по всем пользователям и удаляем одобренные слова из их списков
+    for user_id, user_data in store["users"].items():
+        if "suggested_words" in user_data:
+            before = len(user_data["suggested_words"])
+            user_data["suggested_words"] = [w for w in user_data["suggested_words"] 
+                                         if w not in approved_words]
+            removed_count += before - len(user_data["suggested_words"])
+    
+    # Сохраняем изменения, если что-то было удалено
+    if removed_count > 0:
+        save_store(store)
+
+    # 8. Очищаем suggestions.json
     save_suggestions({"black": set(), "white": set()})
 
-    # 8. Ответ админу
+    # 9. Ответ админу
     await update.message.reply_text(
-        f"Словарь пересобран: +{len(sugg['white'])}, -{len(sugg['black'])}. "
+        f"Словарь пересобран: +{len(sugg['white'])}, -{len(sugg['black'])}.\n"
+        f"Удалено {removed_count} предложений из профилей пользователей.\n"
         "Предложения очищены."
     )
 
@@ -1189,14 +1385,29 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     store = load_store()      # берем тех, кого мы когда-то записали
     failed = []
-    for uid in store["users"].keys():
+    skipped = 0
+    total_sent = 0
+    
+    for uid, user_data in store["users"].items():
+        # Пропускаем забаненных пользователей
+        if user_data.get("banned", False):
+            skipped += 1
+            continue
+            
         try:
             await context.bot.send_message(chat_id=int(uid), text=text)
-        except Exception:
+            total_sent += 1
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения пользователю {uid}: {e}")
             failed.append(uid)
-    msg = "✅ Рассылка успешно отправлена!"
+    
+    msg = f"✅ Рассылка успешно отправлена!\n"
+    msg += f"• Отправлено: {total_sent} пользователям\n"
+    msg += f"• Пропущено (забанено): {skipped}"
+    
     if failed:
-        msg += f"\nНе удалось доставить сообщения пользователям: {', '.join(failed)}"
+        msg += f"\n\n❌ Не удалось доставить сообщения пользователям: {', '.join(failed)}"
+    
     await update.message.reply_text(msg)
     context.user_data.pop("in_broadcast", None)
     context.user_data["just_done"] = True
@@ -1207,6 +1418,99 @@ async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Рассылка отменена.")
     context.user_data.pop("in_broadcast", None)
     return ConversationHandler.END
+
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Блокирует пользователя по ID"""
+    # Проверяем, что команду вызвал администратор
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Проверяем, передан ли ID пользователя
+    if not context.args:
+        await update.message.reply_text("❌ Укажите ID пользователя: /ban <user_id>")
+        return
+    
+    user_id = context.args[0].strip()
+    
+    # Проверяем корректность ID
+    if not user_id.isdigit():
+        await update.message.reply_text("❌ Неверный формат ID. ID должен состоять только из цифр.")
+        return
+    
+    store = load_store()
+    users = store["users"]
+    
+    # Если пользователя нет в базе, добавляем его
+    if user_id not in users:
+        users[user_id] = {
+            "first_name": f"Заблокированный пользователь ({user_id})",
+            "suggested_words": [],
+            "stats": {"games_played": 0, "wins": 0, "losses": 0, "win_rate": 0.0},
+            "banned": True,
+            "notification": False  # Отключаем уведомления при бане
+        }
+        await update.message.reply_text(f"✅ Пользователь с ID {user_id} успешно заблокирован.")
+    else:
+        # Пользователь уже есть в базе, обновляем статус бана
+        if users[user_id].get("banned", False):
+            await update.message.reply_text(f"ℹ️ Пользователь с ID {user_id} уже заблокирован.")
+        else:
+            users[user_id]["banned"] = True
+            users[user_id]["notification"] = False  # Отключаем уведомления при бане
+            await update.message.reply_text(f"✅ Пользователь {users[user_id].get('first_name', user_id)} (ID: {user_id}) успешно заблокирован.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text="❌ Вы были заблокированы в этом боте.\n\n"
+                         "Если вы считаете, что это произошло по ошибке, пожалуйста, свяжитесь с администратором."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о блокировке пользователю {user_id}: {e}")
+    
+    save_store(store)
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разблокирует пользователя по ID"""
+    # Проверяем, что команду вызвал администратор
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Проверяем, передан ли ID пользователя
+    if not context.args:
+        await update.message.reply_text("❌ Укажите ID пользователя: /unban <user_id>")
+        return
+    
+    user_id = context.args[0].strip()
+    
+    # Проверяем корректность ID
+    if not user_id.isdigit():
+        await update.message.reply_text("❌ Неверный формат ID. ID должен состоять только из цифр.")
+        return
+    
+    store = load_store()
+    users = store["users"]
+    
+    if user_id not in users:
+        await update.message.reply_text(f"ℹ️ Пользователь с ID {user_id} не найден в базе.")
+    else:
+        if not users[user_id].get("banned", False):
+            await update.message.reply_text(f"ℹ️ Пользователь с ID {user_id} не заблокирован.")
+        else:
+            users[user_id]["banned"] = False
+            # Удаляем флаг уведомлений, чтобы использовать настройки по умолчанию
+            if "notification" in users[user_id]:
+                del users[user_id]["notification"]
+            save_store(store)
+            await update.message.reply_text(f"✅ Пользователь {users[user_id].get('first_name', user_id)} (ID: {user_id}) успешно разблокирован.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text="✅ Вы были разблокированы в этом боте.\n\n"
+                         "Теперь вы можете снова использовать все функции бота."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о разблокировке пользователю {user_id}: {e}")
 
 
 def main():
@@ -1322,6 +1626,11 @@ def main():
     app.add_handler(CommandHandler("global_stats", global_stats))
     app.add_handler(CommandHandler("dict_file", dict_file))
     app.add_handler(CommandHandler("dump_activity", dump_activity))
+    app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("unban", unban_user))
+    
+    # Обработчик для кнопки предложения слова в белый список
+    app.add_handler(CallbackQueryHandler(suggest_white_callback, pattern=r'^suggest_white:'))
 
     app.run_polling(drop_pending_updates=True)
 
