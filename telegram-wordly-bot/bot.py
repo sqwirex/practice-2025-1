@@ -68,6 +68,7 @@ async def set_commands(app):
             BotCommand("dict_file",  "Посмотреть словарь"),
             BotCommand("dump_activity", "Скачать user_activity.json"),
             BotCommand("suggestions_view", "Посмотреть фидбек юзеров"),
+            BotCommand("suggestions_move", "Переместить слово из белого списка в add список"),
             BotCommand("suggestions_remove", "Удалить что-то из фидбека"),
             BotCommand("suggestions_approve", "Внести изменения в словарь"),
             BotCommand("broadcast", "Отправить сообщение всем юзерам"),
@@ -80,20 +81,21 @@ async def set_commands(app):
 
 
 def load_suggestions() -> dict[str, set[str]]:
-    """Возвращает {'black': set(...), 'white': set(...)} без дубликатов."""
+    """Возвращает {'black': set(...), 'white': set(...), 'add': set(...)} без дубликатов."""
     if not SUGGESTIONS_FILE.exists():
-        return {"black": set(), "white": set()}
+        return {"black": set(), "white": set(), "add": set()}
     raw = SUGGESTIONS_FILE.read_text("utf-8").strip()
     if not raw:
-        return {"black": set(), "white": set()}
+        return {"black": set(), "white": set(), "add": set()}
     try:
         data = json.loads(raw)
         return {
             "black": set(data.get("black", [])),
             "white": set(data.get("white", [])),
+            "add": set(data.get("add", [])),
         }
     except json.JSONDecodeError:
-        return {"black": set(), "white": set()}
+        return {"black": set(), "white": set(), "add": set()}
 
 
 
@@ -104,6 +106,7 @@ def save_suggestions(sugg: dict[str, set[str]]):
     out = {
         "black": sorted(sugg["black"]),
         "white": sorted(sugg["white"]),
+        "add": sorted(sugg["add"]),
     }
     with SUGGESTIONS_FILE.open("w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -394,18 +397,28 @@ BASE_FILE = Path("base_words.json")
 # Читаем список слов из base_words.json
 with BASE_FILE.open("r", encoding="utf-8") as f:
     base_words = json.load(f)
+    if isinstance(base_words, dict):
+        # Если файл уже в новом формате
+        main_words = base_words.get("main", [])
+        additional_words = base_words.get("additional", [])
+    else:
+        # Если файл в старом формате (просто список)
+        main_words = base_words
+        additional_words = []
 
 # Фильтруем по критериям: только буквы, длина 4–11 символов
 # и нормализуем слова (нижний регистр, замена ё на е)
-filtered = [normalize(w) for w in base_words if w.isalpha() and 4 <= len(w) <= 11]
+filtered_main = [normalize(w) for w in main_words if w.isalpha() and 4 <= len(w) <= 11]
+filtered_additional = [normalize(w) for w in additional_words if w.isalpha() and 4 <= len(w) <= 11]
 
 # Удаляем дубликаты, которые могли появиться после нормализации
-filtered = list(dict.fromkeys(filtered))
+filtered_main = list(dict.fromkeys(filtered_main))
+filtered_additional = list(dict.fromkeys(filtered_additional))
 
-# Сортируем список и записываем обратно в base_words.json
-WORDLIST = sorted(filtered)
+# Сортируем списки
+WORDLIST = sorted(filtered_main)
 with BASE_FILE.open("w", encoding="utf-8") as f:
-    json.dump(WORDLIST, f, ensure_ascii=False, indent=2)
+    json.dump({"main": WORDLIST, "additional": sorted(filtered_additional)}, f, ensure_ascii=False, indent=2)
 
 GREEN, YELLOW, WHITE = "🟩", "🟨", "⬜"
 
@@ -431,20 +444,33 @@ def make_feedback(secret: str, guess: str) -> str:
 # --- Обработчики команд ---
 
 def check_ban_status(handler):
-    """Декоратор для проверки бана пользователя перед выполнением обработчика"""
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = str(update.effective_user.id)
-        if await is_banned(user_id):
+        store = load_store()
+        user_data = store["users"].get(user_id, {})
+        
+        if user_data.get("banned", False):
             try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Вы заблокированы в этом боте.", show_alert=True)
-                else:
-                    await update.message.reply_text("❌ Вы заблокированы в этом боте.")
-                return
+                # Проверяем, не отправляли ли мы уже сообщение в этом обновлении
+                if context.user_data.get("last_ban_update_id") != update.update_id:
+                    if update.callback_query:
+                        await update.callback_query.answer("❌ Вы заблокированы в этом боте.", show_alert=True)
+                    else:
+                        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+                    # Запоминаем ID обновления
+                    context.user_data["last_ban_update_id"] = update.update_id
+                return ConversationHandler.END
             except Exception as e:
                 logger.warning(f"Error handling banned user {user_id}: {e}")
                 return
+        else:
+            # Если пользователь был разбанен, очищаем его состояние при первом сообщении
+            if user_data.get("was_banned"):
+                context.user_data.clear()
+                # Удаляем флаг разбана из базы данных
+                user_data.pop("was_banned", None)
+                save_store(store)
         return await handler(update, context, *args, **kwargs)
     return wrapper
 
@@ -673,7 +699,12 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Нормализуем слово для проверки (приводим к нижний регистр и заменяем ё на е)
     normalized_guess = normalize(guess)
     
-    # Валидация
+    # Проверяем на пробелы до проверки длины
+    if " " in guess:
+        await update.message.reply_text("Пожалуйста, введите слово без пробелов.")
+        return GUESSING
+    
+    # Валидация длины
     if len(guess) != length:
         await update.message.reply_text(f"Введите слово из {length} букв.")
         return GUESSING
@@ -690,7 +721,14 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return GUESSING
     
-    if normalized_guess not in WORDLIST:
+    # Проверяем слово в основном и дополнительном списках
+    with BASE_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+        main_words = set(data.get("main", []))
+        additional_words = set(data.get("additional", []))
+        all_words = main_words | additional_words
+    
+    if normalized_guess not in all_words:
         # Предлагаем добавить слово в белый список
         keyboard = [
             [
@@ -705,6 +743,10 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Слово «{normalized_guess}» не найдено в словаре.",
             reply_markup=reply_markup
         )
+        return GUESSING
+
+    if " " in guess:
+        await update.message.reply_text("Пожалуйста, введите слово без пробелов.")
         return GUESSING
 
     # Сохраняем ход
@@ -1069,6 +1111,10 @@ async def feedback_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["just_done"] = True
         return ConversationHandler.END
 
+    if " " in word:
+        await update.message.reply_text("Пожалуйста, введите слово без пробелов.")
+        return FEEDBACK_WORD
+
     suggestions = load_suggestions()
 
     # Черный список: добавляем, только если слово есть в словаре
@@ -1166,20 +1212,28 @@ async def dict_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Читаем свежий словарь из base_words.json
     with BASE_FILE.open("r", encoding="utf-8") as f:
-        fresh_list = json.load(f)
+        data = json.load(f)
+        main_words = data.get("main", [])
+        additional_words = data.get("additional", [])
 
-    total = len(fresh_list)
-    data = "\n".join(fresh_list)
+    total_main = len(main_words)
+    total_additional = len(additional_words)
+    total = total_main + total_additional
 
     # Считаем количество слов каждой длины (4–11)
-    length_counts = Counter(len(w) for w in fresh_list)
-    stats_lines = [
-        f"{length} букв: {length_counts.get(length, 0)}"
-        for length in range(4, 12)
-    ]
+    main_length_counts = Counter(len(w) for w in main_words)
+    additional_length_counts = Counter(len(w) for w in additional_words)
+
+    stats_lines = []
+    for length in range(4, 12):
+        main_count = main_length_counts.get(length, 0)
+        additional_count = additional_length_counts.get(length, 0)
+        stats_lines.append(f"{length} букв: {main_count} (main) + {additional_count} (additional) = {main_count + additional_count}")
+
     stats_text = "\n".join(stats_lines)
 
-    # Упаковываем весь список в файл
+    # Упаковываем списки в файл
+    data = "=== Main Words ===\n" + "\n".join(main_words) + "\n\n=== Additional Words ===\n" + "\n".join(additional_words)
     bio = BytesIO(data.encode("utf-8"))
     bio.name = "wordlist.txt"
 
@@ -1188,7 +1242,9 @@ async def dict_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         document=bio,
         filename="wordlist.txt",
         caption=(
-            f"📚 В словаре всего {total} слов.\n\n"
+            f"📚 В словаре всего {total} слов:\n"
+            f"• {total_main} в основном списке\n"
+            f"• {total_additional} в дополнительном списке\n\n"
             f"🔢 Распределение по длине:\n{stats_text}"
         )
     )
@@ -1225,13 +1281,79 @@ async def suggestions_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sugg = load_suggestions()
     black = sugg.get("black", [])
     white = sugg.get("white", [])
+    add = sugg.get("add", [])
     text = (
         "Предложения для черного списка:\n"
         + (", ".join(f'"{w}"' for w in black) if black else "— пусто")
         + "\n\nПредложения для белого списка:\n"
         + (", ".join(f'"{w}"' for w in white) if white else "— пусто")
+        + "\n\nПредложения для дополнительного списка:\n"
+        + (", ".join(f'"{w}"' for w in add) if add else "— пусто")
     )
     await update.message.reply_text(text)
+
+
+async def suggestions_move_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Только админ
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    # Блокируем во время игры
+    store = load_store()
+    u = store["users"].get(str(update.effective_user.id), {})
+    if "current_game" in u or context.user_data.get("game_active"):
+        await update.message.reply_text("Эту команду можно использовать только вне игры.")
+        return ConversationHandler.END
+
+    # Если все ок — запускаем диалог перемещения
+    await update.message.reply_text(
+        "Введи слова для перемещения в add список (формат):\n"
+        "слово1, слово2, слово3\n\n"
+        "Слова будут перемещены из черного или белого списка в add список.\n"
+        "Или /cancel для отмены."
+    )
+    return REMOVE_INPUT
+
+
+async def suggestions_move_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # только админ
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    
+    context.user_data["in_remove"] = True
+    text = update.message.text.strip()
+    sugg = load_suggestions()
+    moved = {"black": [], "white": []}
+
+    # извлекаем слова через запятую
+    words = [w.strip().lower() for w in text.split(",") if w.strip()]
+    for w in words:
+        # Проверяем наличие слова в черном списке
+        if w in sugg["black"]:
+            sugg["black"].remove(w)
+            sugg["add"].add(w)
+            moved["black"].append(w)
+        # Проверяем наличие слова в белом списке
+        elif w in sugg["white"]:
+            sugg["white"].remove(w)
+            sugg["add"].add(w)
+            moved["white"].append(w)
+
+    save_suggestions(sugg)
+    
+    # формируем ответ
+    parts = []
+    if moved["black"]:
+        parts.append(f'Из черного списка перемещено в add: {", ".join(moved["black"])}')
+    if moved["white"]:
+        parts.append(f'Из белого списка перемещено в add: {", ".join(moved["white"])}')
+    if not parts:
+        parts = ["Ничего не перемещено."]
+        
+    await update.message.reply_text("\n".join(parts))
+    context.user_data.pop("in_remove", None)
+    context.user_data["just_done"] = True
+    return ConversationHandler.END
 
 
 async def suggestions_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1250,7 +1372,8 @@ async def suggestions_remove_start(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(
         "Введи, что удалить (формат):\n"
         "black: слово1, слово2\n"
-        "white: слово3, слово4\n\n"
+        "white: слово3, слово4\n"
+        "add: слово5, слово6\n\n"
         "Или /cancel для отмены."
     )
     return REMOVE_INPUT
@@ -1264,7 +1387,7 @@ async def suggestions_remove_process(update: Update, context: ContextTypes.DEFAU
     context.user_data["in_remove"] = True
     text = update.message.text.strip()
     sugg = load_suggestions()
-    removed = {"black": [], "white": []}
+    removed = {"black": [], "white": [], "add": []}
 
     # парсим построчно
     for line in text.splitlines():
@@ -1272,7 +1395,7 @@ async def suggestions_remove_process(update: Update, context: ContextTypes.DEFAU
             continue
         key, vals = line.split(":", 1)
         key = key.strip().lower()
-        if key not in ("black", "white"):
+        if key not in ("black", "white", "add"):
             continue
         # извлекаем слова через запятую
         words = [w.strip().lower() for w in vals.split(",") if w.strip()]
@@ -1287,8 +1410,8 @@ async def suggestions_remove_process(update: Update, context: ContextTypes.DEFAU
     store = load_store()
     removed_count = 0
     
-    # Собираем все удаленные слова из обоих списков
-    all_removed_words = set(removed["black"]) | set(removed["white"])
+    # Собираем все удаленные слова из всех списков
+    all_removed_words = set(removed["black"]) | set(removed["white"]) | set(removed["add"])
     
     # Проходим по всем пользователям и удаляем слова из их списков
     for user_id, user_data in store["users"].items():
@@ -1308,6 +1431,8 @@ async def suggestions_remove_process(update: Update, context: ContextTypes.DEFAU
         parts.append(f'Из черного удалено: {", ".join(removed["black"])}')
     if removed["white"]:
         parts.append(f'Из белого удалено: {", ".join(removed["white"])}')
+    if removed["add"]:
+        parts.append(f'Из add удалено: {", ".join(removed["add"])}')
     if removed_count > 0:
         parts.append(f'Из профилей пользователей удалено {removed_count} слов.')
     if not parts:
@@ -1324,40 +1449,41 @@ async def suggestions_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # 1. Загружаем предложения
-    sugg = load_suggestions()  # {'black': set(), 'white': set()}
+    sugg = load_suggestions()  # {'black': set(), 'white': set(), 'add': set()}
 
     # 2. Читаем текущий base_words.json
     with BASE_FILE.open("r", encoding="utf-8") as f:
-        words = set(json.load(f))
+        data = json.load(f)
+        main_words = set(data.get("main", []))
+        additional_words = set(data.get("additional", []))
 
-    # 3. Убираем «чёрные» и добавляем «белые»
-    words -= sugg["black"]
-    words |= sugg["white"]
+    # 3. Убираем «чёрные» и добавляем «белые» и «add»
+    main_words -= sugg["black"]
+    main_words |= sugg["white"]
+    additional_words |= sugg["add"]
 
     # 4. Фильтруем по критериям (только буквы, длина 4–11) и сортируем
-    filtered = [w for w in words if w.isalpha() and 4 <= len(w) <= 11]
-    filtered.sort()
+    filtered_main = [w for w in main_words if w.isalpha() and 4 <= len(w) <= 11]
+    filtered_main.sort()
+    filtered_additional = [w for w in additional_words if w.isalpha() and 4 <= len(w) <= 11]
+    filtered_additional.sort()
 
     # 5. Сохраняем обратно в base_words.json
     with BASE_FILE.open("w", encoding="utf-8") as f:
-        json.dump(filtered, f, ensure_ascii=False, indent=2)
+        json.dump({"main": filtered_main, "additional": filtered_additional}, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"-> Wrote {len(filtered)} words to {BASE_FILE.resolve()}")
-
-    with BASE_FILE.open("r", encoding="utf-8") as f:
-        reloaded = json.load(f)
-    logger.info(f"-> On disk now {len(reloaded)} words")
+    logger.info(f"-> Wrote {len(filtered_main)} main words and {len(filtered_additional)} additional words to {BASE_FILE.resolve()}")
 
     # 6. Обновляем глобальный список в памяти
     global WORDLIST
-    WORDLIST = filtered
+    WORDLIST = filtered_main
 
     # 7. Удаляем одобренные слова из списка предложенных у пользователей
     store = load_store()
     removed_count = 0
     
-    # Собираем все одобренные слова (белый список)
-    approved_words = sugg["white"]
+    # Собираем все одобренные слова (белый список и add список)
+    approved_words = sugg["white"] | sugg["add"]
     blacklisted_words = sugg["black"]
     
     # Проходим по всем пользователям и удаляем одобренные слова из их списков
@@ -1375,11 +1501,11 @@ async def suggestions_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         save_store(store)
 
     # 8. Очищаем suggestions.json
-    save_suggestions({"black": set(), "white": set()})
+    save_suggestions({"black": set(), "white": set(), "add": set()})
 
     # 9. Ответ админу
     await update.message.reply_text(
-        f"Словарь пересобран: +{len(sugg['white'])}, -{len(sugg['black'])}.\n"
+        f"Словарь пересобран: +{len(sugg['white'])}, +{len(sugg['add'])}, -{len(sugg['black'])}.\n"
         f"Удалено {removed_count} слов (одобренные и черный список) из профилей пользователей.\n"
         "Предложения очищены."
     )
@@ -1402,8 +1528,8 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_sent = 0
     
     for uid, user_data in store["users"].items():
-        # Пропускаем забаненных пользователей и тех, кто отключил уведомления
-        if user_data.get("banned", False) or user_data.get("notify_on_wakeup") is False:
+        # Пропускаем забаненных пользователей
+        if user_data.get("banned", False):
             skipped += 1
             continue
             
@@ -1416,7 +1542,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = f"✅ Рассылка успешно отправлена!\n"
     msg += f"• Отправлено: {total_sent} пользователям\n"
-    msg += f"• Пропущено (забанено или отключили уведомления): {skipped}"
+    msg += f"• Пропущено (забанено): {skipped}"
     
     if failed:
         msg += f"\n\n❌ Не удалось доставить сообщения пользователям: {', '.join(failed)}"
@@ -1471,6 +1597,9 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             users[user_id]["banned"] = True
             users[user_id]["notification"] = False  # Отключаем уведомления при бане
+            # Сбрасываем состояние guessing
+            if "current_game" in users[user_id]:
+                del users[user_id]["current_game"]
             await update.message.reply_text(f"✅ Пользователь {users[user_id].get('first_name', user_id)} (ID: {user_id}) успешно заблокирован.")
             try:
                 await context.bot.send_message(
@@ -1478,6 +1607,8 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="❌ Вы были заблокированы в этом боте.\n\n"
                          "Если вы считаете, что это произошло по ошибке, пожалуйста, свяжитесь с администратором."
                 )
+                # Сбрасываем состояние пользователя после бана
+                context.user_data.clear()
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление о блокировке пользователю {user_id}: {e}")
     
@@ -1514,6 +1645,12 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Удаляем флаг уведомлений, чтобы использовать настройки по умолчанию
             if "notification" in users[user_id]:
                 del users[user_id]["notification"]
+            # Удаляем текущую игру, если она есть
+            if "current_game" in users[user_id]:
+                del users[user_id]["current_game"]
+            # Устанавливаем флаг, что пользователь был разбанен
+            users[user_id]["was_banned"] = True
+            save_store(store)
             save_store(store)
             await update.message.reply_text(f"✅ Пользователь {users[user_id].get('first_name', user_id)} (ID: {user_id}) успешно разблокирован.")
             try:
@@ -1522,6 +1659,8 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="✅ Вы были разблокированы в этом боте.\n\n"
                          "Теперь вы можете снова использовать все функции бота."
                 )
+                # Устанавливаем флаг, что пользователь был разбанен
+                context.user_data["was_banned"] = True
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление о разблокировке пользователю {user_id}: {e}")
 
@@ -1612,6 +1751,19 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(remove_conv)
+
+    # 3) перемещение через ConversationHandler
+    move_conv = ConversationHandler(
+        entry_points=[CommandHandler("suggestions_move", suggestions_move_start)],
+        states={
+            REMOVE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, suggestions_move_process),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", feedback_cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(move_conv)
 
     broadcast_conv = ConversationHandler(
     entry_points=[CommandHandler("broadcast", broadcast_start)],
