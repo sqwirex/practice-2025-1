@@ -279,14 +279,16 @@ def render_full_board_with_keyboard(
     total_rows: int = 6,
     max_width_px: int = 1080
 ) -> BytesIO:
-    padding   = 6
-    board_def = 80
+    # --- антиалиасинг: рендерим в 3x размере, потом уменьшаем ---
+    scale = 3
+    padding   = 6 * scale
+    board_def = 80 * scale
     cols      = len(secret)
     total_pad = (cols + 1) * padding
 
     # размер квадратика доски
-    board_sq = min(board_def, (max_width_px - total_pad) // cols)
-    board_sq = max(20, board_sq)
+    board_sq = min(board_def, (max_width_px * scale - total_pad) // cols)
+    board_sq = max(20 * scale, board_sq)
 
     board_w = cols * board_sq + total_pad
     board_h = total_rows * board_sq + (total_rows + 1) * padding
@@ -303,11 +305,11 @@ def render_full_board_with_keyboard(
     elif cols == 4:
         factor = 0.25
 
-    kb_sq   = max(12, int(board_sq * factor))
+    kb_sq   = max(12 * scale, int(board_sq * factor))
     kb_rows = len(KB_LAYOUT)
     img_h   = board_h + kb_rows * kb_sq + (kb_rows + 1) * padding
 
-    img        = Image.new("RGB", (board_w, img_h), (30, 30, 30))
+    img        = Image.new("RGB", (board_w, img_h), (24, 24, 32))  # почти чёрный фон
     draw       = ImageDraw.Draw(img)
     font_board = ImageFont.truetype("DejaVuSans-Bold.ttf", int(board_sq * 0.6))
     font_kb    = ImageFont.truetype("DejaVuSans-Bold.ttf", int(kb_sq * 0.6))
@@ -329,23 +331,29 @@ def render_full_board_with_keyboard(
 
             color = fb[c]
             if color == GREEN:
-                bg = (106,170,100)
+                bg = (121,184,81)  # #79b851
             elif color == YELLOW:
-                bg = (201,180,88)
+                bg = (243,194,55)  # #f3c237
             elif color == WHITE:
-                bg = (128,128,128)
+                bg = (72,73,84)  # #484954
             else:
-                bg = (255,255,255)
+                bg = (211,214,218)  # #d3d6da (неактивная)
 
-            draw.rectangle([x0,y0,x1,y1], fill=bg, outline=(0,0,0), width=2)
+            draw.rectangle([x0,y0,x1,y1], fill=bg, outline=(40,40,50), width=2)
 
             if guess:
                 ch = guess[c].upper()
-                tc = (0,0,0) if bg == (255,255,255) else (255,255,255)
+                tc = (255,255,255)  # белые буквы всегда
                 bbox = draw.textbbox((0,0), ch, font=font_board)
                 w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                # Смещение по y для всех, кроме Щ, Ц, Д, Й
+                special_letters = {'щ', 'ц', 'д', 'й'}
+                if ch.lower() in special_letters:
+                    y_offset = -board_sq * 0.05  # специальные буквы чуть выше (5%)
+                else:
+                    y_offset = -board_sq * 0.10  # остальные буквы выше (10%)
                 draw.text(
-                    (x0 + (board_sq-w)/2, y0 + (board_sq-h)/2),
+                    (x0 + (board_sq-w)/2, y0 + (board_sq-h)/2 + y_offset),
                     ch, font=font_board, fill=tc
                 )
 
@@ -365,28 +373,36 @@ def render_full_board_with_keyboard(
 
             st = letter_status.get(ch)
             if st == "green":
-                bg = (106,170,100)
+                bg = (121,184,81)  # #79b851
             elif st == "yellow":
-                bg = (201,180,88)
+                bg = (243,194,55)  # #f3c237
             elif st == "red":
-                bg = (128,128,128)
+                bg = (72,73,84)  # #484954
             else:
-                bg = (255,255,255)
+                bg = (129,130,155)  # #81829b — обычные буквы на клавиатуре
 
-            draw.rectangle([x0,y0,x1,y1], fill=bg, outline=(0,0,0), width=1)
-            tc = (0,0,0) if bg == (255,255,255) else (255,255,255)
+            draw.rectangle([x0,y0,x1,y1], fill=bg, outline=(40,40,50), width=1)
+            tc = (255,255,255)  # белые буквы всегда
             letter = ch.upper()
             bbox   = draw.textbbox((0,0), letter, font=font_kb)
             w, h   = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            # Смещение по y для всех, кроме Щ, Ц, Д, Й
+            special_letters = {'щ', 'ц', 'д', 'й'}
+            if ch in special_letters:
+                y_offset = -kb_sq * 0.05  # специальные буквы чуть выше (5%)
+            else:
+                y_offset = -kb_sq * 0.10  # остальные буквы выше (10%)
             draw.text(
-                (x0 + (kb_sq-w)/2, y0 + (kb_sq-h)/2),
+                (x0 + (kb_sq-w)/2, y0 + (kb_sq-h)/2 + y_offset),
                 letter, font=font_kb, fill=tc
             )
 
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    # уменьшение до нормального размера с антиалиасингом
+    final_img = img.resize((board_w // scale, img_h // scale), Image.LANCZOS)
+    final_buf = BytesIO()
+    final_img.save(final_buf, format="PNG")
+    final_buf.seek(0)
+    return final_buf
 
 # --- Константы и словарь ---
 ASK_LENGTH, GUESSING, FEEDBACK_CHOOSE, FEEDBACK_WORD, REMOVE_INPUT, BROADCAST= range(6)
@@ -1715,6 +1731,7 @@ def main():
                 CommandHandler("play", ignore_ask),
                 CommandHandler("hint", hint_not_allowed),
                 CommandHandler("reset", reset),
+                CommandHandler("notification", only_outside_game),
                 CommandHandler("my_stats", only_outside_game),
                 CommandHandler("global_stats", only_outside_game),
             ],
@@ -1725,6 +1742,7 @@ def main():
 		        CommandHandler("play", ignore_guess),
                 CommandHandler("hint", hint),
                 CommandHandler("reset", reset),
+                CommandHandler("notification", only_outside_game),
                 CommandHandler("my_stats", only_outside_game),
                 CommandHandler("global_stats", only_outside_game),
             ],
